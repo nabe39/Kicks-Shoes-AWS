@@ -33,22 +33,27 @@ resource "aws_iam_role_policy" "cost_guard_actions" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "StopEC2"
+        Sid    = "ScaleECS"
         Effect = "Allow"
         Action = [
-          "ec2:DescribeInstances",
-          "ec2:StopInstances"
+          "ecs:DescribeServices",
+          "ecs:UpdateService"
         ]
         Resource = "*"
       },
       {
-        Sid    = "StopRDS"
+        Sid    = "ScaleAppAutoScaling"
         Effect = "Allow"
         Action = [
-          "rds:DescribeDBInstances",
-          "rds:StopDBInstance",
-          "rds:ListTagsForResource"
+          "application-autoscaling:DescribeScalableTargets",
+          "application-autoscaling:RegisterScalableTarget"
         ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ViewBudgets"
+        Effect = "Allow"
+        Action = "budgets:ViewBudget"
         Resource = "*"
       }
     ]
@@ -65,7 +70,7 @@ resource "aws_cloudwatch_log_group" "cost_guard" {
 # Lambda Function
 resource "aws_lambda_function" "cost_guard" {
   function_name = "${var.project_name}-cost-guard"
-  description   = "Stops dev EC2/RDS not tagged keep=true — daily + Budgets trigger"
+  description   = "Scales down ECS Fargate to 0 — daily + Budgets trigger"
   role          = aws_iam_role.cost_guard.arn
   handler       = "index.handler"
   runtime       = "python3.12"
@@ -75,11 +80,20 @@ resource "aws_lambda_function" "cost_guard" {
   filename         = "${path.module}/../../../../../backend/lambda/cost-guard/cost-guard.zip"
   source_code_hash = fileexists("${path.module}/../../../../../backend/lambda/cost-guard/cost-guard.zip") ? filebase64sha256("${path.module}/../../../../../backend/lambda/cost-guard/cost-guard.zip") : null
 
+  environment {
+    variables = {
+      ECS_CLUSTER_NAME = local.ecs_cluster_name
+      ECS_SERVICE_NAME = local.ecs_service_name
+      BUDGET_NAME      = aws_budgets_budget.monthly_cost_cap.name
+      ACCOUNT_ID       = data.aws_caller_identity.current.account_id
+    }
+  }
+
   depends_on = [aws_cloudwatch_log_group.cost_guard]
   tags       = local.common_tags
 }
 
-# EventBridge Scheduler — daily 20:00 UTC
+# EventBridge Scheduler — daily 20:00 VN (Tối - Scale Down)
 resource "aws_scheduler_schedule" "cost_guard_daily" {
   name       = "${var.project_name}-cost-guard-daily"
   group_name = "default"
@@ -89,11 +103,31 @@ resource "aws_scheduler_schedule" "cost_guard_daily" {
   }
 
   schedule_expression = "cron(0 20 * * ? *)"
+  schedule_expression_timezone = "Asia/Ho_Chi_Minh"
 
   target {
     arn      = aws_lambda_function.cost_guard.arn
     role_arn = aws_iam_role.scheduler_cost_guard.arn
-    input    = jsonencode({ source = "scheduled" })
+    input    = jsonencode({ source = "scheduled-night" })
+  }
+}
+
+# EventBridge Scheduler — daily 08:00 VN (Sáng - Scale Up)
+resource "aws_scheduler_schedule" "cost_guard_morning" {
+  name       = "${var.project_name}-cost-guard-morning"
+  group_name = "default"
+
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  schedule_expression = "cron(0 8 * * ? *)"
+  schedule_expression_timezone = "Asia/Ho_Chi_Minh"
+
+  target {
+    arn      = aws_lambda_function.cost_guard.arn
+    role_arn = aws_iam_role.scheduler_cost_guard.arn
+    input    = jsonencode({ source = "scheduled-morning" })
   }
 }
 

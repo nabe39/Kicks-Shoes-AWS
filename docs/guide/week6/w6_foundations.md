@@ -20,7 +20,7 @@ Không code tính năng mới (không thêm giỏ hàng, không đổi UI). Ch�
 | W1–W2 | VPC, ECS chạy backend | Tòa nhà + phòng server chạy app |
 | W3 | ALB, CloudFront, FE | Cổng vào + CDN phục vụ web |
 | W4 | Cognito, Secrets | Thẻ nhân viên + két mật khẩu |
-| W5 | Firewall, API Gateway, EFS, Backup | Kiểm lâm + cổng API AI + ổ cứng + sao lưu |
+| W5 | Firewall, API Gateway, S3, Backup | Kiểm lâm + cổng API AI + kho lưu trữ + sao lưu |
 
 W6 **không xây lại tòa nhà** — chỉ gắn thêm: đồng hồ đo tiền, báo động, robot tắt máy, robot khóa S3.
 
@@ -52,7 +52,8 @@ flowchart LR
     end
     subgraph A["MH-COST-A — Hành động tiền"]
         L[cost-guard Lambda]
-        L -->|stop| EC2[EC2/RDS dev]
+        L -->|Tối: scale 0| ECS[ECS Fargate]
+        L -->|Sáng: scale 1| ECS
     end
     subgraph O["MH-OBS — Nhìn thấy sức khỏe app"]
         M[Metric + Dashboard]
@@ -68,7 +69,7 @@ flowchart LR
 | Trụ | Câu hỏi trả lời | Không làm thì sao? |
 |-----|------------------|-------------------|
 | **COST-V** | Tháng này đốt bao nhiêu? Ai chịu trách nhiệm? | Không biết service nào đắt → vượt $150 |
-| **COST-A** | Tự động tắt máy dev khi không dùng? | EC2 quên tắt → cháy tiền đêm |
+| **COST-A** | Tự động tắt ECS Fargate khi không dùng? | App chạy rỗng ban đêm → cháy tiền compute |
 | **OBS** | App chậm/lỗi ở đâu? | Không biết Bedrock chậm hay ECS sập |
 | **SEC** | Ai mở S3 public có tự khóa lại? | Lộ ảnh khách hàng |
 
@@ -111,14 +112,13 @@ flowchart LR
 
 | | **EC2** | **RDS** | **Lambda** |
 |--|---------|---------|------------|
-| Là gì | Máy ảo (server) | Database quản lý | Hàm code ngắn |
-| Trả tiền khi | Bật (running) | Chạy (available) | Mỗi lần invoke |
-| cost-guard làm gì | **Stop** (tắt máy, giữ disk) | **Stop** | **Không** stop Lambda |
-| Kicks Shoes dùng? | Chỉ EC2 **demo** W6 | Nếu có RDS demo | cost-guard + security-guard + bedrock |
+| Là gì | Serverless Container | Serverless Function |
+| Trả tiền khi | Chạy (running tasks) | Mỗi lần invoke |
+| cost-guard làm gì | **Scale count = 0** | **Không** stop Lambda |
+| Kicks Shoes dùng? | Web app Backend | cost-guard + security-guard + bedrock |
 
-**Stop ≠ Delete (Terminate):**
-- **Stop** = tắt máy, **vẫn tính phí disk**, bật lại được → cost-guard dùng stop (an toàn).
-- **Terminate** = xóa hẳn → mất data — **không** dùng trong workshop.
+**Scale 0 ≠ Delete (Terminate):**
+- **Scale 0** = Dừng container, không tốn compute, giữ nguyên code, sáng bật lại nhanh chóng.
 
 ---
 
@@ -140,6 +140,12 @@ User mở FE (CloudFront)
 
 ## 8. Luồng tiền & cost-guard (chi tiết từng bước)
 
+### 💡 Bối cảnh E-commerce (Tại sao phải Scale 0 ban đêm?)
+Kicks-Shoes là một dự án E-commerce tích hợp AI đang trong giai đoạn phát triển (**Môi trường DEV**). Ở môi trường DEV, team Developer chỉ code và test hệ thống vào giờ hành chính. Tuy nhiên, nếu cứ để Serverless Container (ECS Fargate) chạy 24/7, dự án sẽ "đốt" tiền vô ích vào ban đêm và cuối tuần. 
+Do đó, chúng ta cần một cơ chế **Smart Wake-up (Thức dậy thông minh)**:
+- **Tối (20:00 UTC):** Lambda dọn dẹp, ép số lượng container về 0.
+- **Sáng (01:00 UTC):** Lambda kiểm tra hóa đơn (Budgets). Nếu tiền chưa vượt ngưỡng $150, nó sẽ dựng container (Scale = 1) trở lại để team Dev vào làm việc bình thường. Nếu đã vượt $150, nó kiên quyết để hệ thống "ngủ" luôn nhằm bảo vệ túi tiền.
+
 ### 8.1 Chỉ nhìn (COST-V)
 
 1. Mọi resource có **tag** `Application=KicksShoes`, `CostCenter=G13`…
@@ -148,19 +154,25 @@ User mở FE (CloudFront)
 
 ### 8.2 Nhìn + hành động (COST-A)
 
-**Trigger A — Lịch (20:00 UTC mỗi ngày):**
+**Trigger A — Lịch Tối (20:00 UTC mỗi ngày):**
 ```
-EventBridge Scheduler → gọi cost-guard Lambda
-    → liệt kê EC2/RDS tag Environment=dev
-    → không có keep=true → StopInstances / StopDBInstance
-```
-
-**Trigger B — Budget vượt ngưỡng (trễ 8–24h):**
-```
-Budget → SNS topic alerts → Lambda cost-guard (cùng logic stop)
+EventBridge Scheduler → gọi cost-guard Lambda (source: scheduled-night)
+    → khóa Auto Scaling (Min=0)
+    → ép số lượng container chạy xuống 0 (DesiredCount=0)
 ```
 
-**Tag `keep=true`:** Dán lên EC2/RDS “đừng tắt em” (bastion, máy demo quan trọng).
+**Trigger B — Lịch Sáng (01:00 UTC mỗi ngày):**
+```
+EventBridge Scheduler → gọi cost-guard Lambda (source: scheduled-morning)
+    → Đọc AWS Budgets (hạn mức $150)
+    → Nếu vượt $150: Dừng, không bật.
+    → Nếu an toàn: Mở Auto Scaling (Min=1) và Bật lại Container (DesiredCount=1).
+```
+
+**Trigger C — Budget vượt ngưỡng (Bất cứ lúc nào trễ 8–24h):**
+```
+Budget → SNS topic alerts → Lambda cost-guard (logic tắt giống Trigger A)
+```
 
 ---
 
@@ -205,6 +217,12 @@ CloudWatch Alarm cần **đủ điểm dữ liệu** trong khoảng thời gian 
 
 **Vì sao cần zip?** Terraform **không** build code giúp bạn — nó chỉ upload file `.zip` có sẵn lên Lambda.
 
+### 💡 [Deep-Dive] Terraform làm gì khi ta xóa EFS và cập nhật hệ thống?
+Khi chạy lệnh `terraform apply` để gỡ bỏ ổ đĩa EFS, Terraform không "mù quáng" xóa bừa bãi. 
+Nó đối chiếu **Terraform State** (File trạng thái ghi nhớ những gì đã tạo tuần trước) với cấu hình mới nhất trong code. 
+- Nó nhận ra bạn đã xóa khối `aws_efs_file_system` trong code, nên nó sẽ tính toán: *"Cần phải xóa ổ EFS trên AWS, đồng thời xóa luôn 2 Mount Targets và Security Group liên quan"*. 
+- Quá trình này mất khoảng 1-3 phút vì AWS cần đảm bảo không có container nào đang ghi dữ liệu trước khi thực sự "rút phích cắm" ổ đĩa cứng mạng đó. Việc này thể hiện sức mạnh của **Infrastructure as Code (IaC)**: Sạch sẽ, không để lại rác (orphan resources), và quản lý phụ thuộc (dependencies) chuẩn xác!
+
 ---
 
 ## 12. Lộ trình đọc đề xuất (mất gốc)
@@ -232,7 +250,7 @@ Nếu đã có kinh nghiệm AWS: bỏ qua bước 1, đọc README → must_hav
 Đ: Đề có thể ghi daily; repo Kicks Shoes dùng **monthly $150**. Evidence: giải thích 1 câu trong ADR.
 
 **H: cost-guard có tắt ECS/Fargate không?**  
-Đ: **Không** — code chỉ stop EC2 và RDS. ECS vẫn chạy (và vẫn tốn tiền). Tiết kiệm ECS = scale `desired_count` (path khác).
+Đ: **Có** — Hệ thống Kicks-Shoes đã được nâng cấp (Bonus Optimized) để tự động scale ECS Fargate về 0 nhằm tiết kiệm tiền triệt để.
 
 **H: Activate tag xong mà Cost Explorer vẫn trống?**  
 Đ: Đợi **24h**. Tag chỉ áp dụng cho cost **phát sinh sau** khi activate.
@@ -249,8 +267,8 @@ Nếu đã có kinh nghiệm AWS: bỏ qua bước 1, đọc README → must_hav
 
 - [ ] Giải thích được W6 khác W5 thế nào (vận hành vs tính năng mạng)
 - [ ] Kể được 4 MH bằng lời của mình
-- [ ] Phân biệt EC2 / RDS / Lambda và cost-guard tác động lên cái nào
-- [ ] Giải thích Stop vs Terminate
+- [ ] Phân biệt Serverless Fargate / Lambda và cách cost-guard tác động
+- [ ] Hiểu khái niệm Scale về 0 thay vì Stop EC2
 - [ ] Vẽ được luồng Budget → SNS → Lambda
 - [ ] Biết vì sao alarm có thể INSUFFICIENT_DATA và cách fix
 - [ ] Biết CloudTrail dùng để làm evidence gì
